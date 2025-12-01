@@ -1,4 +1,3 @@
-// src/hooks/useActivityClassifier.js
 import { useState, useEffect, useRef } from 'react';
 import { Accelerometer } from 'expo-sensors';
 import { LocationService } from '../services/LocationService';
@@ -20,8 +19,9 @@ export const useActivityClassifier = () => {
     steps: 0,
     calories: 0,
     averageSpeed: 0,
-    activityLogs: []
+    activityLogs: [],
   });
+
   const [location, setLocation] = useState(null);
   const [acceleration, setAcceleration] = useState(null);
 
@@ -30,165 +30,185 @@ export const useActivityClassifier = () => {
   const lastLocation = useRef(null);
   const accelerometerSubscription = useRef(null);
 
+  // ───────────────────────────────────────────────
+  // PERMISOS
+  // ───────────────────────────────────────────────
   useEffect(() => {
     requestPermissions();
   }, []);
 
   const requestPermissions = async () => {
     try {
-      console.log('Solicitando permisos...');
-      
-      // Solicitar permisos de ubicación
       let locationStatus = await LocationService.requestPermissions();
-      console.log('Estado permisos ubicación:', locationStatus);
-      
-      // Solicitar permisos de acelerómetro
       let accelerometerStatus = await Accelerometer.requestPermissionsAsync();
-      console.log('Estado permisos acelerómetro:', accelerometerStatus);
-      
-      const permissionsGranted = locationStatus && accelerometerStatus.status === 'granted';
-      
-      setHasPermission(permissionsGranted);
-      
-      if (!permissionsGranted) {
-        console.warn('Permisos no otorgados');
-      }
-    } catch (error) {
-      console.error('Error solicitando permisos:', error);
+
+      const ok =
+        locationStatus && accelerometerStatus.status === 'granted';
+
+      setHasPermission(ok);
+
+      if (!ok) console.warn('Permisos NO otorgados');
+    } catch (e) {
+      console.error('Error solicitando permisos:', e);
     }
   };
 
-  // ... resto del código permanece igual
+  // ───────────────────────────────────────────────
+  // INICIAR TRACKING
+  // ───────────────────────────────────────────────
   const startTracking = () => {
     if (!hasPermission) {
-      alert('No permissions granted. Please enable location and motion permissions.');
+      alert('Permite ubicación y movimiento para iniciar.');
       return;
     }
 
     setIsActive(true);
     setActivityLogs([]);
-    setSessionStats(prev => ({
-      ...prev,
+
+    setSessionStats({
       startTime: Date.now(),
+      endTime: 0,
+      duration: 0,
       totalDistance: 0,
       steps: 0,
       calories: 0,
-      averageSpeed: 0
-    }));
-
-    // Iniciar seguimiento de ubicación
-    stopLocationTracking.current = LocationService.startTracking((location) => {
-      const newLocation = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        speed: location.coords.speed,
-        accuracy: location.coords.accuracy,
-        timestamp: location.timestamp
-      };
-
-      setLocation(newLocation);
-
-      // Calcular distancia
-      if (lastLocation.current) {
-        const distance = LocationService.calculateDistance(
-          lastLocation.current.latitude,
-          lastLocation.current.longitude,
-          newLocation.latitude,
-          newLocation.longitude
-        );
-        setSessionStats(prev => ({
-          ...prev,
-          totalDistance: prev.totalDistance + distance
-        }));
-      }
-      lastLocation.current = newLocation;
+      averageSpeed: 0,
+      activityLogs: [],
     });
 
-    // Iniciar acelerómetro
-    Accelerometer.setUpdateInterval(1000);
-    accelerometerSubscription.current = Accelerometer.addListener((accelData) => {
-      const magnitude = classifier.calculateMagnitude(accelData.x, accelData.y, accelData.z);
-      const newAcceleration = {
-        ...accelData,
-        magnitude,
-        timestamp: Date.now()
-      };
-      setAcceleration(newAcceleration);
+    lastLocation.current = null;
 
-      // Clasificar actividad
-      if (location) {
-        const { type, confidence: conf } = classifier.getActivity(location.speed, magnitude);
+    // ─── GPS ─────────────────────────────────────────
+    stopLocationTracking.current = LocationService.startTracking(gps => {
+      const now = Date.now();
+
+      const newLoc = {
+        latitude: gps.coords.latitude,
+        longitude: gps.coords.longitude,
+        accuracy: gps.coords.accuracy,
+        timestamp: gps.timestamp,
+      };
+
+      // Cálculo de velocidad manual
+      if (lastLocation.current) {
+        const dt = (now - lastLocation.current.timestamp) / 1000;
+        const dist = LocationService.calculateDistance(
+          lastLocation.current.latitude,
+          lastLocation.current.longitude,
+          newLoc.latitude,
+          newLoc.longitude
+        );
+
+        const speed = dist / dt;
+        newLoc.speed = isFinite(speed) ? speed : 0;
+
+        setSessionStats(prev => ({
+          ...prev,
+          totalDistance: prev.totalDistance + (isFinite(dist) ? dist : 0),
+        }));
+      } else {
+        newLoc.speed = 0;
+      }
+
+      lastLocation.current = newLoc;
+      setLocation(newLoc);
+    });
+
+    // ─── ACELERÓMETRO ──────────────────────────────
+    Accelerometer.setUpdateInterval(1000);
+    accelerometerSubscription.current = Accelerometer.addListener(accel => {
+      const magnitude = classifier.calculateMagnitude(
+        accel.x,
+        accel.y,
+        accel.z
+      );
+
+      const accelData = {
+        ...accel,
+        magnitude,
+        timestamp: Date.now(),
+      };
+
+      setAcceleration(accelData);
+
+      if (location?.latitude && location?.longitude) {
+        // Clasificación con velocidad manual
+        const { type, confidence: conf } = classifier.getActivity(
+          location.speed ?? 0,
+          magnitude
+        );
+
         setCurrentActivity(type);
         setConfidence(conf);
 
-        // Crear ActivityLog
+        // Crear log válido
         const log = {
           id: Date.now().toString(),
           timestamp: Date.now(),
-          location,
-          acceleration: newAcceleration,
+          location: location,
+          acceleration: accelData,
           activityType: type,
           confidence: conf,
-          speed: location.speed
+          speed: location.speed,
         };
 
         setActivityLogs(prev => [...prev, log]);
 
-        // Actualizar stats
+        // Calcular stats
         setSessionStats(prev => {
           const duration = (Date.now() - prev.startTime) / 1000;
-          const averageSpeed = duration > 0 ? prev.totalDistance / duration : 0;
+          const avg = prev.totalDistance / (duration || 1);
+
           let steps = prev.steps;
           let calories = prev.calories;
-          const distanceIncrement = lastLocation.current ? 0.1 : 0; // Pequeño incremento
 
-          if (type === ActivityType.WALKING || type === ActivityType.RUNNING) {
+          if (type === ActivityType.WALKING || type === ActivityType.RUNNING)
             steps += 1;
-          }
-          
-          if (type === ActivityType.RUNNING) {
-            calories += 0.1;
-          } else if (type === ActivityType.WALKING) {
-            calories += 0.05;
-          }
+
+          if (type === ActivityType.RUNNING) calories += 0.1;
+          if (type === ActivityType.WALKING) calories += 0.05;
 
           return {
             ...prev,
             duration,
-            averageSpeed,
-            steps: Math.round(steps),
-            calories: parseFloat(calories.toFixed(2))
+            averageSpeed: avg,
+            steps,
+            calories,
           };
         });
       }
     });
-
-    return () => {
-      if (accelerometerSubscription.current) {
-        accelerometerSubscription.current.remove();
-      }
-    };
   };
 
+  // ───────────────────────────────────────────────
+  // DETENER TRACKING
+  // ───────────────────────────────────────────────
   const stopTracking = async () => {
     setIsActive(false);
-    if (stopLocationTracking.current) {
-      stopLocationTracking.current();
-    }
+
     if (accelerometerSubscription.current) {
       accelerometerSubscription.current.remove();
     }
-    
-    const stats = {
+
+    if (stopLocationTracking.current) {
+      stopLocationTracking.current();
+    }
+
+    const finalStats = {
       ...sessionStats,
       endTime: Date.now(),
-      activityLogs
+      activityLogs,
     };
-    setSessionStats(stats);
+
+    setSessionStats(finalStats);
+
     await StorageService.saveLogs(activityLogs);
-    await StorageService.saveStats(stats);
+    await StorageService.saveStats(finalStats);
+
+    return finalStats;
   };
 
+  // ───────────────────────────────────────────────
   return {
     currentActivity,
     confidence,
@@ -200,6 +220,6 @@ export const useActivityClassifier = () => {
     location,
     acceleration,
     hasPermission,
-    requestPermissions // Exportamos esta función para poder llamarla desde la UI
+    requestPermissions,
   };
 };
